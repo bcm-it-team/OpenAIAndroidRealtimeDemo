@@ -18,6 +18,7 @@
         android:roundIcon="@drawable/ic_launcher"
         android:supportsRtl="true"
         android:theme="@style/Theme.AppCompat.NoActionBar"
+        android:usesCleartextTraffic="false"
         tools:targetApi="31">
         <activity
             android:name=".RealTimeActivity"

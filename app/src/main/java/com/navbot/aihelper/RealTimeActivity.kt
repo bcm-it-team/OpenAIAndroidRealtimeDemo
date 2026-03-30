@@ -2,48 +2,57 @@ package com.navbot.aihelper
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
-import android.media.MediaPlayer
 import android.media.MediaRecorder
 import android.media.audiofx.AcousticEchoCanceler
 import android.media.audiofx.AutomaticGainControl
 import android.media.audiofx.NoiseSuppressor
+import android.media.AudioDeviceInfo
+import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Base64
 import android.util.Log
-import android.widget.Button
-import android.widget.TextView
 import androidx.activity.ComponentActivity
+import androidx.activity.enableEdgeToEdge
 import androidx.core.app.ActivityCompat
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.updatePadding
 import com.blankj.utilcode.util.ToastUtils
+import com.navbot.aihelper.databinding.ActivityNewBinding
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONObject
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.io.IOException
-import java.io.RandomAccessFile
-import java.text.SimpleDateFormat
-import java.util.Date
 import java.util.LinkedList
-import java.util.Locale
 import java.util.Queue
 import java.util.concurrent.Executors
 
 class RealTimeActivity : ComponentActivity() {
     private val TAG = "Realtime"
+    private lateinit var binding: ActivityNewBinding
     private lateinit var webSocket: okhttp3.WebSocket
+    private var isWebSocketConnected = false  // WebSocket 연결 상태
     private var isRecording = false
     private var audioRecord: AudioRecord? = null
+    private var audioSessionId: Int = 0  // AudioRecord와 AudioTrack이 공유할 sessionId
+
+    // 에코 캔슬레이션 및 노이즈 억제 객체
+    private var acousticEchoCanceler: AcousticEchoCanceler? = null
+    private var noiseSuppressor: NoiseSuppressor? = null
+    private var automaticGainControl: AutomaticGainControl? = null
 
     private var audioTrack: AudioTrack? = null
+    private var audioManager: AudioManager? = null
+    private var isSpeakerOn = true  // 스피커 활성화 상태
     private val permissions = arrayOf(Manifest.permission.RECORD_AUDIO)
 
     private lateinit var waveView: CircleWaveView
@@ -59,17 +68,191 @@ class RealTimeActivity : ComponentActivity() {
      */
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        setContentView(R.layout.activity_new)
-        waveView = findViewById(R.id.circle_wave_view)
-        findViewById<Button>(R.id.btn_clear_and_reset).setOnClickListener {
+        binding = ActivityNewBinding.inflate(layoutInflater)
+        setContentView(binding.root)
+
+        enableEdgeToEdge()
+
+        // WindowInsets 처리 - 하단 네비게이션 바 겹침 방지
+        ViewCompat.setOnApplyWindowInsetsListener(binding.root) { view, windowInsets ->
+            val insets = windowInsets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.updatePadding(
+                left = insets.left,
+                top = insets.top,
+                right = insets.right,
+                bottom = insets.bottom
+            )
+            windowInsets
+        }
+
+        // AudioManager 초기화 및 통화 모드 설정 (에코 캔슬레이션 활성화)
+        audioManager = getSystemService(AUDIO_SERVICE) as AudioManager
+        audioManager?.mode = AudioManager.MODE_IN_COMMUNICATION
+        // 기본 출력은 스피커로 고정 (S+에선 통신 디바이스로 지정)
+        setOutputRoute(true)
+        Log.d(TAG, "AudioManager configured: mode=IN_COMMUNICATION, route=Speaker")
+
+        waveView = binding.circleWaveView
+        binding.btnClearAndReset.setOnClickListener {
             sendSessionUpdate()
             sendClearBufferEvent()
+        }
+
+        // 스피커/핸드셋 전환 버튼
+        binding.btnSpeakerToggle.setOnClickListener {
+            toggleSpeaker()
+        }
+
+        // WebSocket 연결/해제 버튼
+        binding.btnWebsocketToggle.setOnClickListener {
+            toggleWebSocketConnection()
         }
 
         ActivityCompat.requestPermissions(this, permissions, 200)
         window.statusBarColor = android.graphics.Color.BLACK  // Set the status bar to transparent
 
         test()
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // AudioManager 설정 복원
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            audioManager?.clearCommunicationDevice()
+        } else {
+            @Suppress("DEPRECATION")
+            run { audioManager?.isSpeakerphoneOn = false }
+        }
+        audioManager?.mode = AudioManager.MODE_NORMAL
+        Log.d(TAG, "AudioManager restored to normal mode")
+    }
+
+    /**
+     * 스피커(내장) & 핸드셋(이어피스) 간 출력 라우팅 전환
+     * - Android 12(API 31)+ : setCommunicationDevice() 사용
+     * - 이하 버전 : isSpeakerphoneOn 플래그 사용
+     */
+    private fun setOutputRoute(toSpeaker: Boolean) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            val targetType = if (toSpeaker) AudioDeviceInfo.TYPE_BUILTIN_SPEAKER else AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+            val dev = audioManager?.availableCommunicationDevices?.firstOrNull { it.type == targetType }
+            val ok = if (dev != null) audioManager?.setCommunicationDevice(dev) == true else false
+            Log.d(TAG, "setCommunicationDevice(${if (toSpeaker) "SPEAKER" else "EARPIECE"}) -> $ok")
+        } else {
+            @Suppress("DEPRECATION")
+            run {
+                audioManager?.isSpeakerphoneOn = toSpeaker
+                Log.d(TAG, "isSpeakerphoneOn = $toSpeaker (legacy)")
+            }
+        }
+    }
+
+    /**
+     * 스피커/핸드셋 전환 기능
+     */
+    private fun toggleSpeaker() {
+        isSpeakerOn = !isSpeakerOn
+        setOutputRoute(isSpeakerOn)
+
+        // 라우팅 변경이 즉시 반영되도록 재생 중 여부와 무관하게 트랙 재생성
+        audioTrack?.stop()
+        audioTrack?.flush()
+        audioTrack?.release()
+        audioTrack = null
+        isPlayingAudio = false
+        Log.d(TAG, "AudioTrack released for route change")
+
+        // 버튼 UI 업데이트
+        if (isSpeakerOn) {
+            binding.btnSpeakerToggle.text = "🔊"  // 스피커 아이콘
+            binding.btnSpeakerToggle.setBackgroundColor(getColor(android.R.color.holo_green_light))
+            ToastUtils.showShort("스피커 모드")
+        } else {
+            binding.btnSpeakerToggle.text = "📱"  // 핸드셋 아이콘
+            binding.btnSpeakerToggle.setBackgroundColor(getColor(android.R.color.holo_blue_light))
+            ToastUtils.showShort("핸드셋 모드")
+        }
+
+        Log.d(TAG, "Audio output switched to: ${if (isSpeakerOn) "Speaker" else "Earpiece"}")
+    }
+
+    /**
+     * WebSocket 연결/해제 전환 기능
+     */
+    private fun toggleWebSocketConnection() {
+        if (isWebSocketConnected) {
+            // 연결 해제
+            disconnectWebSocket()
+        } else {
+            // 연결
+            connectWebSocket()
+        }
+    }
+
+    /**
+     * WebSocket 연결
+     */
+    private fun connectWebSocket() {
+        // 권한 확인
+        if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            ToastUtils.showShort("마이크 권한이 필요합니다")
+            ActivityCompat.requestPermissions(this, permissions, 200)
+            return
+        }
+
+        initWebSocket()
+        isWebSocketConnected = true
+        updateWebSocketButton()
+        ToastUtils.showShort("연결 중...")
+        Log.d(TAG, "WebSocket connection initiated")
+    }
+
+    /**
+     * WebSocket 연결 해제
+     */
+    private fun disconnectWebSocket() {
+        // 오디오 녹음 중지
+        if (isRecording) {
+            isRecording = false
+        }
+
+        // 오디오 효과 해제
+        releaseAudioEffects()
+
+        // AudioRecord 해제
+        audioRecord?.stop()
+        audioRecord?.release()
+        audioRecord = null
+
+        // AudioTrack 해제
+        audioTrack?.stop()
+        audioTrack?.release()
+        audioTrack = null
+
+        // WebSocket 종료
+        if (::webSocket.isInitialized) {
+            webSocket.close(1000, "User disconnected")
+        }
+
+        isWebSocketConnected = false
+        updateWebSocketButton()
+        ToastUtils.showShort("연결이 해제되었습니다")
+        Log.d(TAG, "WebSocket disconnected")
+    }
+
+    /**
+     * WebSocket 버튼 상태 업데이트
+     */
+    private fun updateWebSocketButton() {
+        runOnUiThread {
+            if (isWebSocketConnected) {
+                binding.btnWebsocketToggle.text = "🔌 연결됨"
+                binding.btnWebsocketToggle.setBackgroundColor(getColor(android.R.color.holo_red_light))
+            } else {
+                binding.btnWebsocketToggle.text = "🔌 연결하기"
+                binding.btnWebsocketToggle.setBackgroundColor(getColor(android.R.color.holo_green_light))
+            }
+        }
     }
 
     /**
@@ -86,10 +269,10 @@ class RealTimeActivity : ComponentActivity() {
         if (requestCode == 200 && grantResults.isNotEmpty()
             && grantResults[0] == PackageManager.PERMISSION_GRANTED
         ) {
-            ToastUtils.showShort("Permission granted")
-            initWebSocket() // Initialize WebSocket once permission is granted
+            ToastUtils.showShort("권한이 부여되었습니다")
+            // 자동 연결 제거 - 사용자가 버튼으로 직접 연결하도록 변경
         } else {
-            ToastUtils.showShort("Permission denied")
+            ToastUtils.showShort("권한이 거부되었습니다")
         }
     }
 
@@ -98,21 +281,43 @@ class RealTimeActivity : ComponentActivity() {
      * Sets up the authorization headers and handles WebSocket events such as connection and message reception.
      */
     private fun initWebSocket() {
-        val client = okhttp3.OkHttpClient()
-        val request = okhttp3.Request.Builder()
-            .url(Config.WSURL)
-            .addHeader("Authorization", "Bearer ${Config.OPENAI_API_KEY}")
+        val client = OkHttpClient()
+        val request = Request.Builder()
+            .url(BuildConfig.WSURL)
+            .addHeader("Authorization", "Bearer ${BuildConfig.OPENAI_API_KEY}")
             .addHeader("OpenAI-Beta", "realtime=v1")
             .build()
 
         webSocket = client.newWebSocket(request, object : okhttp3.WebSocketListener() {
             override fun onOpen(webSocket: okhttp3.WebSocket, response: okhttp3.Response) {
                 Log.d(TAG, "WebSocket connection opened")
-
+                isWebSocketConnected = true
+                runOnUiThread {
+                    updateWebSocketButton()
+                    ToastUtils.showShort("WebSocket 연결 성공!")
+                }
             }
 
             override fun onMessage(webSocket: okhttp3.WebSocket, text: String) {
                 handleWebSocketMessage(text)
+            }
+
+            override fun onFailure(webSocket: okhttp3.WebSocket, t: Throwable, response: okhttp3.Response?) {
+                Log.e(TAG, "WebSocket connection failed: ${t.message}", t)
+                isWebSocketConnected = false
+                runOnUiThread {
+                    updateWebSocketButton()
+                    ToastUtils.showShort("WebSocket 연결 실패: ${t.message}")
+                }
+            }
+
+            override fun onClosed(webSocket: okhttp3.WebSocket, code: Int, reason: String) {
+                Log.d(TAG, "WebSocket connection closed: $code - $reason")
+                isWebSocketConnected = false
+                runOnUiThread {
+                    updateWebSocketButton()
+                    ToastUtils.showShort("WebSocket 연결 종료")
+                }
             }
         })
     }
@@ -137,7 +342,7 @@ class RealTimeActivity : ComponentActivity() {
             "session.updated" -> {
                 Log.d(TAG, "Session updated. Starting audio recording.")
 
-                if (!isRecording){
+                if (!isRecording) {
                     startAudioRecording() // Start audio recording in real-time
                 }
 
@@ -147,7 +352,7 @@ class RealTimeActivity : ComponentActivity() {
                 val questionText = eventJson.optString("transcript", "")
                 Log.d(TAG, "User Question: $questionText")
                 runOnUiThread {
-                    findViewById<TextView>(R.id.ask_tv).text = questionText
+                    binding.askTv.text = questionText
                 }
 
             }
@@ -155,7 +360,7 @@ class RealTimeActivity : ComponentActivity() {
             "conversation.item.created" -> {
                 runOnUiThread {
                     fullAnswerText.clear()
-                    findViewById<TextView>(R.id.answer_tv).text = ""
+                    binding.answerTv.text = ""
                 }
             }
 
@@ -166,7 +371,7 @@ class RealTimeActivity : ComponentActivity() {
                 fullAnswerText.append(deltaText)
 
                 runOnUiThread {
-                    findViewById<TextView>(R.id.answer_tv).text = fullAnswerText.toString()
+                    binding.answerTv.text = fullAnswerText.toString()
                 }
             }
 
@@ -353,7 +558,7 @@ class RealTimeActivity : ComponentActivity() {
 
         Log.d(TAG, "Starting audio recording")
         audioRecord = AudioRecord(
-            MediaRecorder.AudioSource.VOICE_COMMUNICATION,  //  VOICE_COMMUNICATION
+            MediaRecorder.AudioSource.VOICE_COMMUNICATION,  // 에코 캔슬레이션을 위한 최적 소스
             sampleRate,
             channelConfig,
             audioFormat,
@@ -361,7 +566,15 @@ class RealTimeActivity : ComponentActivity() {
         ).apply {
             startRecording()
         }
+
+        // AudioRecord의 sessionId 저장 (AudioTrack과 공유하기 위해)
+        audioSessionId = audioRecord?.audioSessionId ?: 0
+        Log.d(TAG, "Audio session ID: $audioSessionId")
+
         isRecording = true
+
+        // 에코 캔슬레이션 활성화
+        setupAudioEffects()
 
         // test code
         tempAudioFilePath = "${externalCacheDir?.absolutePath}/temp_audio.pcm"
@@ -384,6 +597,7 @@ class RealTimeActivity : ComponentActivity() {
             } catch (e: Exception) {
                 Log.e(TAG, "Error during audio recording: ${e.message}", e)
             } finally {
+                releaseAudioEffects()  // 오디오 이펙트 먼저 해제
                 audioRecord?.release()
                 audioFileOutputStream?.close()
                 Log.i(TAG, "Audio recording stopped")
@@ -406,6 +620,56 @@ class RealTimeActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * 에코 캔슬레이션, 노이즈 억제, 자동 게인 컨트롤 설정
+     * 스피커에서 나오는 AI 음성이 마이크로 다시 들어가는 것을 방지
+     */
+    private fun setupAudioEffects() {
+        audioRecord?.audioSessionId?.let { sessionId ->
+            // 에코 캔슬레이션 (AEC)
+            if (AcousticEchoCanceler.isAvailable()) {
+                acousticEchoCanceler = AcousticEchoCanceler.create(sessionId)
+                acousticEchoCanceler?.enabled = true
+                Log.d(TAG, "AcousticEchoCanceler enabled: ${acousticEchoCanceler?.enabled}")
+            } else {
+                Log.w(TAG, "AcousticEchoCanceler is not available on this device")
+            }
+
+            // 노이즈 억제 (NS)
+            if (NoiseSuppressor.isAvailable()) {
+                noiseSuppressor = NoiseSuppressor.create(sessionId)
+                noiseSuppressor?.enabled = true
+                Log.d(TAG, "NoiseSuppressor enabled: ${noiseSuppressor?.enabled}")
+            } else {
+                Log.w(TAG, "NoiseSuppressor is not available on this device")
+            }
+
+            // 자동 게인 컨트롤 (AGC)
+            if (AutomaticGainControl.isAvailable()) {
+                automaticGainControl = AutomaticGainControl.create(sessionId)
+                automaticGainControl?.enabled = true
+                Log.d(TAG, "AutomaticGainControl enabled: ${automaticGainControl?.enabled}")
+            } else {
+                Log.w(TAG, "AutomaticGainControl is not available on this device")
+            }
+        }
+    }
+
+    /**
+     * 오디오 이펙트 해제
+     */
+    private fun releaseAudioEffects() {
+        acousticEchoCanceler?.release()
+        acousticEchoCanceler = null
+
+        noiseSuppressor?.release()
+        noiseSuppressor = null
+
+        automaticGainControl?.release()
+        automaticGainControl = null
+
+        Log.d(TAG, "Audio effects released")
+    }
 
     /**
      * Clears the audio queue that holds incoming audio data.
@@ -449,21 +713,45 @@ class RealTimeActivity : ComponentActivity() {
      */
     private fun playAudio(audioData: ByteArray) {
         if (audioTrack == null) {
-            audioTrack = AudioTrack(
-                AudioManager.STREAM_MUSIC,
-                24000,
-                AudioFormat.CHANNEL_OUT_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                AudioTrack.getMinBufferSize(
-                    24000,
-                    AudioFormat.CHANNEL_OUT_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT
-                ),
-                AudioTrack.MODE_STREAM
-            ).apply {
-                play()
+            // AudioAttributes를 사용한 최신 방식으로 에코 캔슬레이션 최적화
+            val audioAttributes = AudioAttributes.Builder()
+                .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)  // 음성 통화용
+                .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)  // 음성 컨텐츠
+                .build()
+
+            val audioFormat = AudioFormat.Builder()
+                .setSampleRate(24000)
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                .build()
+
+            audioTrack = AudioTrack.Builder()
+                .setAudioAttributes(audioAttributes)
+                .setAudioFormat(audioFormat)
+                .setBufferSizeInBytes(
+                    AudioTrack.getMinBufferSize(
+                        24000,
+                        AudioFormat.CHANNEL_OUT_MONO,
+                        AudioFormat.ENCODING_PCM_16BIT
+                    )
+                )
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .setSessionId(audioSessionId)  // AudioRecord와 같은 sessionId (핵심!)
+                .build()
+
+            // M(API 23)+ 에서 preferredDevice 힌트 제공 (S 미만)
+            if (Build.VERSION.SDK_INT in Build.VERSION_CODES.M until Build.VERSION_CODES.S) {
+                val outputs = (getSystemService(AUDIO_SERVICE) as AudioManager)
+                    .getDevices(AudioManager.GET_DEVICES_OUTPUTS)
+                val targetType = if (isSpeakerOn) AudioDeviceInfo.TYPE_BUILTIN_SPEAKER else AudioDeviceInfo.TYPE_BUILTIN_EARPIECE
+                val hint = outputs.firstOrNull { it.type == targetType }
+                hint?.let { audioTrack?.preferredDevice = it }
             }
-            Log.d(TAG, "Audio track initialized and started")
+
+            audioTrack?.play()
+
+            Log.d(TAG, "AudioTrack created with VOICE_COMMUNICATION usage, session: $audioSessionId")
+            Log.d(TAG, "Output route: ${if (isSpeakerOn) "Speaker" else "Earpiece"}")
         }
         try {
             audioTrack?.write(audioData, 0, audioData.size)
@@ -562,7 +850,7 @@ class RealTimeActivity : ComponentActivity() {
         )
 
         var n = 0
-        findViewById<Button>(R.id.btnSendText).setOnClickListener {
+        binding.btnSendText.setOnClickListener {
 
             val js = """
                 
@@ -600,54 +888,41 @@ class RealTimeActivity : ComponentActivity() {
 
         }
 
-        findViewById<Button>(R.id.stopws).setOnClickListener {
-            // 关闭 WebSocket
-            webSocket.close(1000, "User closed connection")
+        // stopws 버튼 제거됨 - 대신 btn_websocket_toggle 버튼 사용
 
-            // 停止录音
-            if (isRecording && audioRecord != null) {
-                isRecording = false
-                audioRecord?.stop()  // 停止录音
-                audioRecord?.release()  // 释放录音资源
-                audioRecord = null
-                Log.i(TAG, "AudioRecord stopped and released")
-            }
-
-            // 停止播放并释放 AudioTrack
-            if (audioTrack != null) {
-                if (audioTrack?.playState == AudioTrack.PLAYSTATE_PLAYING) {
-                    audioTrack?.stop()  // 停止播放
-                }
-                audioTrack?.release()  // 释放资源
-                audioTrack = null
-                Log.i(TAG, "AudioTrack released")
-            }
-
-            // 清空所有资源
-            isPlaying = false
-        }
-
-
-        findViewById<Button>(R.id.playmys).setOnClickListener {
+        binding.playmys.setOnClickListener {
             // 播放send之前保存的语音文件
             if (tempAudioFilePath != null) {
                 val audioFile = File(tempAudioFilePath!!)
                 val fileInputStream = FileInputStream(audioFile)
                 val buffer = ByteArray(1024)
 
-                // 初始化AudioTrack来播放保存的音频文件
-                audioTrack = AudioTrack(
-                    AudioManager.STREAM_MUSIC,
-                    16000,  // 确保采样率和录制时相同
-                    AudioFormat.CHANNEL_OUT_MONO,
-                    AudioFormat.ENCODING_PCM_16BIT,
-                    AudioTrack.getMinBufferSize(
-                        16000,
-                        AudioFormat.CHANNEL_OUT_MONO,
-                        AudioFormat.ENCODING_PCM_16BIT
-                    ),
-                    AudioTrack.MODE_STREAM
-                )
+                // AudioAttributes를 사용한 최신 방식 (에코 캔슬레이션 최적화)
+                val audioAttributes = AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_VOICE_COMMUNICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                    .build()
+
+                val audioFormat = AudioFormat.Builder()
+                    .setSampleRate(16000)
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setChannelMask(AudioFormat.CHANNEL_OUT_MONO)
+                    .build()
+
+                audioTrack = AudioTrack.Builder()
+                    .setAudioAttributes(audioAttributes)
+                    .setAudioFormat(audioFormat)
+                    .setBufferSizeInBytes(
+                        AudioTrack.getMinBufferSize(
+                            16000,
+                            AudioFormat.CHANNEL_OUT_MONO,
+                            AudioFormat.ENCODING_PCM_16BIT
+                        )
+                    )
+                    .setTransferMode(AudioTrack.MODE_STREAM)
+                    .setSessionId(audioSessionId)
+                    .build()
+
                 audioTrack?.play()
 
                 var readBytes: Int

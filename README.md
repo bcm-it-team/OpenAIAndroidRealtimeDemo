@@ -33,3 +33,6 @@ Real-time API live demo at OpenAI'dev day:    (https://www.youtube.com/watch?v=m
 Takeaways OpenAI'dev day: (https://www.youtube.com/watch?v=LIR21LcfRpM&t=64s)
 
 
+### local.properties
+- OPENAI_API_KEY="openai api key"
+- WSURL="wss://api.openai.com/v1/realtime?model=gpt-4o-mini-realtime-preview"
